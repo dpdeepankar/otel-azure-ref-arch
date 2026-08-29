@@ -1,0 +1,149 @@
+name: Build and Deploy Traffic Generator
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  AZURE_ACA_ENV_NAME: ${{ vars.AZURE_ACA_ENV_NAME }}
+  AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+
+  TRAFFIC_GENERATOR_APP_NAME: ${{ vars.TRAFFIC_GENERATOR_APP_NAME }}
+  TRAFFIC_GENERATOR_IMAGE_NAME: ${{ vars.TRAFFIC_GENERATOR_IMAGE_NAME }}
+
+jobs:
+
+  build:
+    name: Build and Push Traffic Generator Image
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      image_tag: ${{ steps.image.outputs.image_tag }}
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: >
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Resolve ACR login server
+        id: acr
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACR_LOGIN_SERVER="$(
+            az acr show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$AZURE_ACR_NAME" \
+              --query loginServer \
+              --output tsv
+          )"
+
+          test -n "$ACR_LOGIN_SERVER"
+
+          echo "login_server=$ACR_LOGIN_SERVER" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ACR
+        run: |
+          az acr login \
+            --name "$AZURE_ACR_NAME"
+
+      - name: Calculate image reference
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${GITHUB_SHA::8}"
+
+          IMAGE="${{ steps.acr.outputs.login_server }}/${TRAFFIC_GENERATOR_IMAGE_NAME}:${IMAGE_TAG}"
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Image: $IMAGE"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Traffic Generator image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/traffic-generator
+          file: ./apps/traffic-generator/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+
+      - name: Verify image in ACR
+        run: |
+          az acr repository show \
+            --name "$AZURE_ACR_NAME" \
+            --image "${TRAFFIC_GENERATOR_IMAGE_NAME}:${{ steps.image.outputs.image_tag }}" \
+            --output table
+
+  deploy:
+    name: Deploy Traffic Generator Container App
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: >
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Deploy Traffic Generator
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_ACA_ENV_NAME: ${{ vars.AZURE_ACA_ENV_NAME }}
+          AZURE_ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+
+          TRAFFIC_GENERATOR_APP_NAME: ${{ vars.TRAFFIC_GENERATOR_APP_NAME }}
+          TRAFFIC_GENERATOR_IMAGE_NAME: ${{ vars.TRAFFIC_GENERATOR_IMAGE_NAME }}
+          TRAFFIC_GENERATOR_IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+
+          AZURE_TRAFFIC_GENERATOR_IMAGE: ${{ needs.build.outputs.image }}
+
+        run: |
+          chmod +x ./infra/deploy-traffic-generator.sh
+          ./infra/deploy-traffic-generator.sh
+
+      - name: Verify Traffic Generator
+        run: |
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$TRAFFIC_GENERATOR_APP_NAME" \
+            --query '{
+              name:name,
+              provisioningState:properties.provisioningState,
+              runningStatus:properties.runningStatus
+            }' \
+            --output yaml
