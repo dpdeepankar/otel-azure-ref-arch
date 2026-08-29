@@ -12,13 +12,15 @@ RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-rg-otel-azure-ref-arch}"
 
 ACR_NAME="${AZURE_ACR_NAME:-otelazureacr}"
 
-IMAGE_NAME="${ALLOY_IMAGE_NAME:-otel-alloy}"
+IMAGE_NAME="${PYTHON_IMAGE_NAME:-otel-python}"
 
-IMAGE_TAG="${ALLOY_IMAGE_TAG:-$(git rev-parse --short HEAD)}"
+IMAGE_TAG="${PYTHON_IMAGE_TAG:-$(git rev-parse --short HEAD)}"
 
-DOCKERFILE="${ALLOY_DOCKERFILE:-otel-alloy/Dockerfile}"
+DOCKERFILE="${PYTHON_DOCKERFILE:-apps/otel-python/Dockerfile}"
 
-BUILD_CONTEXT="${ALLOY_BUILD_CONTEXT:-otel-alloy}"
+BUILD_CONTEXT="${PYTHON_BUILD_CONTEXT:-apps/otel-python}"
+
+TARGET_PLATFORM="${PYTHON_TARGET_PLATFORM:-linux/amd64}"
 
 #######################################
 # Helpers
@@ -53,9 +55,6 @@ command -v git >/dev/null 2>&1 || \
 
 [[ -f "$DOCKERFILE" ]] || \
     fail "Dockerfile not found: $DOCKERFILE"
-
-[[ -f "$BUILD_CONTEXT/config.alloy" ]] || \
-    fail "Alloy config not found: $BUILD_CONTEXT/config.alloy"
 
 #######################################
 # Azure subscription
@@ -109,16 +108,16 @@ echo "  $IMAGE_REFERENCE"
 # Build
 #######################################
 
-log "Building Alloy image"
+log "Building Python image"
 
 podman build \
-    --platform linux/amd64 \
+    --platform "$TARGET_PLATFORM" \
     --file "$DOCKERFILE" \
     --tag "$IMAGE_REFERENCE" \
     "$BUILD_CONTEXT"
 
 #######################################
-# Verify local image architecture
+# Verify image architecture
 #######################################
 
 log "Verifying image architecture"
@@ -131,15 +130,15 @@ IMAGE_PLATFORM="$(
 echo "Image platform:"
 echo "  $IMAGE_PLATFORM"
 
-if [[ "$IMAGE_PLATFORM" != "linux/amd64" ]]; then
-    fail "Alloy image must be linux/amd64 for the current Azure Container Apps target. Found: $IMAGE_PLATFORM"
+if [[ "$IMAGE_PLATFORM" != "$TARGET_PLATFORM" ]]; then
+    fail "Python image platform mismatch. Expected: $TARGET_PLATFORM, Found: $IMAGE_PLATFORM"
 fi
 
 #######################################
 # Push
 #######################################
 
-log "Pushing Alloy image"
+log "Pushing Python image"
 
 podman push "$IMAGE_REFERENCE"
 
@@ -158,7 +157,7 @@ az acr repository show \
 # Complete
 #######################################
 
-log "Alloy build complete"
+log "Python build complete"
 
 cat <<EOF
 
@@ -175,9 +174,9 @@ export AZURE_SUBSCRIPTION_ID="$SUBSCRIPTION_ID"
 export AZURE_RESOURCE_GROUP="$RESOURCE_GROUP"
 export AZURE_ACR_NAME="$ACR_NAME"
 
-export AZURE_ALLOY_IMAGE_REPOSITORY="$IMAGE_NAME"
-export AZURE_ALLOY_IMAGE_TAG="$IMAGE_TAG"
-export AZURE_ALLOY_IMAGE="$IMAGE_REFERENCE"
+export PYTHON_IMAGE_NAME="$IMAGE_NAME"
+export PYTHON_IMAGE_TAG="$IMAGE_TAG"
+export AZURE_PYTHON_IMAGE="$IMAGE_REFERENCE"
 
 
 ============================================================
@@ -186,8 +185,6 @@ export AZURE_ALLOY_IMAGE="$IMAGE_REFERENCE"
 
 Run:
 
-  ./infra/deploy-alloy.sh
+  ./infra/deploy-python.sh
 
 EOF
-
-
