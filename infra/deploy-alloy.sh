@@ -29,13 +29,13 @@ ALLOY_IMAGE_TAG="${AZURE_ALLOY_IMAGE_TAG:-latest}"
 ALLOY_IMAGE="${AZURE_ALLOY_IMAGE:-${ACR_LOGIN_SERVER}/${ALLOY_IMAGE_REPOSITORY}:${ALLOY_IMAGE_TAG}}"
 
 #######################################
-# User Assigned Managed Identity
+# Managed Identity
 #######################################
 
 ALLOY_ACR_IDENTITY_NAME="${AZURE_ALLOY_ACR_IDENTITY_NAME:-id-otel-acr-pull}"
 
 #######################################
-# OTLP ports
+# Alloy ports
 #######################################
 
 ALLOY_OTLP_GRPC_PORT="${AZURE_ALLOY_OTLP_GRPC_PORT:-4317}"
@@ -53,12 +53,6 @@ GRAFANA_CLOUD_API_KEY="${GRAFANA_CLOUD_API_KEY:?GRAFANA_CLOUD_API_KEY is require
 GRAFANA_CLOUD_OTLP_ENDPOINT="${GRAFANA_CLOUD_OTLP_ENDPOINT:?GRAFANA_CLOUD_OTLP_ENDPOINT is required}"
 
 #######################################
-# Alloy configuration
-#######################################
-
-ALLOY_CONFIG_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../otel-alloy" && pwd)/config.alloy"
-
-#######################################
 # Helpers
 #######################################
 
@@ -69,26 +63,47 @@ log() {
     echo "============================================================"
 }
 
+fail() {
+    echo "ERROR: $1"
+    exit 1
+}
+
 #######################################
 # Validation
 #######################################
 
 log "Validating prerequisites"
 
-command -v az >/dev/null 2>&1 || {
-    echo "ERROR: Azure CLI (az) is required."
-    exit 1
-}
+command -v az >/dev/null 2>&1 || \
+    fail "Azure CLI (az) is required."
 
-command -v base64 >/dev/null 2>&1 || {
-    echo "ERROR: base64 is required."
-    exit 1
-}
+command -v git >/dev/null 2>&1 || \
+    fail "Git is required."
 
-if [[ ! -f "$ALLOY_CONFIG_FILE" ]]; then
-    echo "ERROR: Alloy config not found:"
-    echo "$ALLOY_CONFIG_FILE"
-    exit 1
+#######################################
+# Verify containerapp extension
+#######################################
+
+log "Checking Azure Container Apps CLI extension"
+
+if ! az extension show \
+    --name containerapp \
+    --output none 2>/dev/null; then
+
+    echo "Container Apps extension not found. Installing..."
+
+    az extension add \
+        --name containerapp \
+        --upgrade \
+        --output none
+
+else
+
+    echo "Container Apps extension found."
+
+    az extension update \
+        --name containerapp \
+        --output none
 fi
 
 #######################################
@@ -106,14 +121,9 @@ az account set \
 
 log "Verifying resource group"
 
-if ! az group show \
+az group show \
     --name "$RESOURCE_GROUP" \
-    --output none 2>/dev/null; then
-
-    echo "ERROR: Resource group does not exist:"
-    echo "$RESOURCE_GROUP"
-    exit 1
-fi
+    --output none
 
 #######################################
 # Verify ACA environment
@@ -130,13 +140,11 @@ ACA_ENV_STATE="$(
 )"
 
 if [[ "$ACA_ENV_STATE" != "Succeeded" ]]; then
-    echo "ERROR: Container Apps environment is not ready."
-    echo "Current state: $ACA_ENV_STATE"
-    exit 1
+    fail "ACA environment is not ready. Current state: $ACA_ENV_STATE"
 fi
 
-echo "ACA environment: $ACA_ENV_NAME"
-echo "State: $ACA_ENV_STATE"
+echo "ACA environment:"
+echo "  $ACA_ENV_NAME"
 
 #######################################
 # Verify ACR
@@ -146,24 +154,21 @@ log "Verifying Azure Container Registry"
 
 ACR_RESOURCE_ID="$(
     az acr show \
-        --name "$ACR_NAME" \
         --resource-group "$RESOURCE_GROUP" \
+        --name "$ACR_NAME" \
         --query "id" \
         --output tsv
 )"
 
-if [[ -z "$ACR_RESOURCE_ID" ]]; then
-    echo "ERROR: Azure Container Registry not found:"
-    echo "$ACR_NAME"
-    exit 1
-fi
+[[ -n "$ACR_RESOURCE_ID" ]] || \
+    fail "Could not resolve ACR resource ID."
 
 echo "ACR:"
 echo "  Name:   $ACR_NAME"
 echo "  Server: $ACR_LOGIN_SERVER"
 
 #######################################
-# Verify ACR ARM token authentication
+# Verify ACR ARM authentication
 #######################################
 
 log "Checking ACR ARM token authentication"
@@ -177,8 +182,8 @@ ACR_ARM_AUTH="$(
 
 if [[ "$ACR_ARM_AUTH" != "enabled" ]]; then
 
-    echo "ACR ARM audience token authentication is not enabled."
-    echo "Enabling it..."
+    echo "ACR ARM authentication is not enabled."
+    echo "Enabling..."
 
     az acr config authentication-as-arm update \
         --registry "$ACR_NAME" \
@@ -186,48 +191,33 @@ if [[ "$ACR_ARM_AUTH" != "enabled" ]]; then
         --output none
 fi
 
-echo "ACR ARM token authentication: enabled"
+echo "ACR ARM authentication: enabled"
 
 #######################################
-# Verify Alloy image exists
+# Verify Alloy image
 #######################################
 
 log "Verifying Alloy image"
 
-if ! az acr repository show \
+az acr repository show \
     --name "$ACR_NAME" \
     --image "${ALLOY_IMAGE_REPOSITORY}:${ALLOY_IMAGE_TAG}" \
-    --output none 2>/dev/null; then
+    --output table
 
-    echo "ERROR: Alloy image does not exist in ACR:"
-    echo "$ALLOY_IMAGE"
-    echo
-    echo "Build/push the image before running this deployment."
-    exit 1
-fi
-
-echo "Alloy image:"
+echo
+echo "Image:"
 echo "  $ALLOY_IMAGE"
 
 #######################################
-# User Assigned Managed Identity
+# Managed Identity
 #######################################
 
-log "Ensuring Alloy ACR managed identity exists"
+log "Ensuring ACR pull managed identity"
 
-IDENTITY_EXISTS=false
-
-if az identity show \
+if ! az identity show \
     --resource-group "$RESOURCE_GROUP" \
     --name "$ALLOY_ACR_IDENTITY_NAME" \
     --output none 2>/dev/null; then
-
-    IDENTITY_EXISTS=true
-
-    echo "Managed identity already exists:"
-    echo "  $ALLOY_ACR_IDENTITY_NAME"
-
-else
 
     echo "Creating managed identity:"
     echo "  $ALLOY_ACR_IDENTITY_NAME"
@@ -236,27 +226,19 @@ else
         --resource-group "$RESOURCE_GROUP" \
         --name "$ALLOY_ACR_IDENTITY_NAME" \
         --output none
+else
+    echo "Managed identity already exists."
 fi
 
 #######################################
 # Identity details
 #######################################
 
-log "Reading managed identity details"
-
 ALLOY_ACR_IDENTITY_ID="$(
     az identity show \
         --resource-group "$RESOURCE_GROUP" \
         --name "$ALLOY_ACR_IDENTITY_NAME" \
         --query "id" \
-        --output tsv
-)"
-
-ALLOY_ACR_IDENTITY_CLIENT_ID="$(
-    az identity show \
-        --resource-group "$RESOURCE_GROUP" \
-        --name "$ALLOY_ACR_IDENTITY_NAME" \
-        --query "clientId" \
         --output tsv
 )"
 
@@ -268,21 +250,23 @@ ALLOY_ACR_IDENTITY_PRINCIPAL_ID="$(
         --output tsv
 )"
 
-echo "Managed identity:"
-echo "  Name:         $ALLOY_ACR_IDENTITY_NAME"
-echo "  Resource ID:  $ALLOY_ACR_IDENTITY_ID"
-echo "  Client ID:    $ALLOY_ACR_IDENTITY_CLIENT_ID"
-echo "  Principal ID:  $ALLOY_ACR_IDENTITY_PRINCIPAL_ID"
+ALLOY_ACR_IDENTITY_CLIENT_ID="$(
+    az identity show \
+        --resource-group "$RESOURCE_GROUP" \
+        --name "$ALLOY_ACR_IDENTITY_NAME" \
+        --query "clientId" \
+        --output tsv
+)"
 
 #######################################
-# Assign AcrPull
+# AcrPull
 #######################################
 
 log "Ensuring AcrPull role assignment"
 
 ACR_PULL_ROLE_ID="7f951dda-4ed3-4680-a7ca-43fe172d538d"
 
-EXISTING_ROLE_ASSIGNMENT="$(
+EXISTING_ROLE="$(
     az role assignment list \
         --assignee-object-id "$ALLOY_ACR_IDENTITY_PRINCIPAL_ID" \
         --scope "$ACR_RESOURCE_ID" \
@@ -291,9 +275,9 @@ EXISTING_ROLE_ASSIGNMENT="$(
         --output tsv
 )"
 
-if [[ -z "$EXISTING_ROLE_ASSIGNMENT" ]]; then
+if [[ -z "$EXISTING_ROLE" ]]; then
 
-    echo "Creating AcrPull role assignment..."
+    echo "Creating AcrPull assignment..."
 
     az role assignment create \
         --assignee-object-id "$ALLOY_ACR_IDENTITY_PRINCIPAL_ID" \
@@ -311,19 +295,7 @@ else
 fi
 
 #######################################
-# Encode Alloy configuration
-#######################################
-
-log "Encoding Alloy configuration"
-
-ALLOY_CONFIG_BASE64="$(
-    base64 < "$ALLOY_CONFIG_FILE" | tr -d '\n'
-)"
-
-echo "Alloy configuration encoded."
-
-#######################################
-# Deploy / update Alloy
+# Create / update Alloy
 #######################################
 
 if az containerapp show \
@@ -332,16 +304,24 @@ if az containerapp show \
     --output none 2>/dev/null; then
 
     ###################################
-    # Existing Container App
+    # Existing app
     ###################################
 
     log "Updating existing Alloy Container App"
+
+    ###################################
+    # Ensure managed identity attached
+    ###################################
 
     az containerapp identity assign \
         --resource-group "$RESOURCE_GROUP" \
         --name "$ALLOY_APP_NAME" \
         --user-assigned "$ALLOY_ACR_IDENTITY_ID" \
         --output none
+
+    ###################################
+    # Update secrets
+    ###################################
 
     az containerapp secret set \
         --resource-group "$RESOURCE_GROUP" \
@@ -351,12 +331,20 @@ if az containerapp show \
             grafana-api-key="$GRAFANA_CLOUD_API_KEY" \
         --output none
 
+    ###################################
+    # Configure ACR registry
+    ###################################
+
     az containerapp registry set \
         --resource-group "$RESOURCE_GROUP" \
         --name "$ALLOY_APP_NAME" \
         --server "$ACR_LOGIN_SERVER" \
         --identity "$ALLOY_ACR_IDENTITY_ID" \
         --output none
+
+    ###################################
+    # Update image/env
+    ###################################
 
     az containerapp update \
         --resource-group "$RESOURCE_GROUP" \
@@ -371,7 +359,7 @@ if az containerapp show \
 else
 
     ###################################
-    # New Container App
+    # New app
     ###################################
 
     log "Creating Alloy Container App"
@@ -386,8 +374,8 @@ else
         --min-replicas 1 \
         --max-replicas 2 \
         --user-assigned "$ALLOY_ACR_IDENTITY_ID" \
-        --registry-identity "$ALLOY_ACR_IDENTITY_ID" \
         --registry-server "$ACR_LOGIN_SERVER" \
+        --registry-identity "$ALLOY_ACR_IDENTITY_ID" \
         --secrets \
             grafana-instance-id="$GRAFANA_CLOUD_INSTANCE_ID" \
             grafana-api-key="$GRAFANA_CLOUD_API_KEY" \
@@ -404,23 +392,81 @@ else
 fi
 
 #######################################
-# Explicitly configure registry
+# Add OTLP gRPC additional TCP port
 #######################################
 
-log "Configuring ACR managed identity"
+log "Configuring OTLP gRPC additional TCP port"
 
-az containerapp registry set \
+ALLOY_YAML="$(mktemp)"
+
+trap 'rm -f "$ALLOY_YAML"' EXIT
+
+az containerapp show \
     --resource-group "$RESOURCE_GROUP" \
     --name "$ALLOY_APP_NAME" \
-    --server "$ACR_LOGIN_SERVER" \
-    --identity "$ALLOY_ACR_IDENTITY_ID" \
+    --output yaml > "$ALLOY_YAML"
+
+python3 - "$ALLOY_YAML" "$ALLOY_OTLP_GRPC_PORT" <<'PY'
+import sys
+import yaml
+
+path = sys.argv[1]
+grpc_port = int(sys.argv[2])
+
+with open(path, "r", encoding="utf-8") as f:
+    data = yaml.safe_load(f)
+
+ingress = (
+    data
+    .setdefault("properties", {})
+    .setdefault("configuration", {})
+    .setdefault("ingress", {})
+)
+
+existing = ingress.get("additionalPortMappings") or []
+
+# Remove any existing mapping for this target port.
+existing = [
+    mapping
+    for mapping in existing
+    if mapping.get("targetPort") != grpc_port
+]
+
+existing.append({
+    "exposedPort": grpc_port,
+    "external": False,
+    "targetPort": grpc_port,
+})
+
+ingress["additionalPortMappings"] = existing
+
+with open(path, "w", encoding="utf-8") as f:
+    yaml.safe_dump(data, f, sort_keys=False)
+PY
+
+az containerapp update \
+    --resource-group "$RESOURCE_GROUP" \
+    --name "$ALLOY_APP_NAME" \
+    --yaml "$ALLOY_YAML" \
     --output none
 
 #######################################
-# Verify Container App identity
+# Verify ingress
 #######################################
 
-log "Checking Container App identity"
+log "Verifying Alloy ingress"
+
+az containerapp show \
+    --resource-group "$RESOURCE_GROUP" \
+    --name "$ALLOY_APP_NAME" \
+    --query 'properties.configuration.ingress' \
+    --output yaml
+
+#######################################
+# Verify managed identity
+#######################################
+
+log "Verifying managed identity"
 
 az containerapp identity show \
     --resource-group "$RESOURCE_GROUP" \
@@ -428,10 +474,10 @@ az containerapp identity show \
     --output yaml
 
 #######################################
-# Verify registry configuration
+# Verify registry
 #######################################
 
-log "Checking registry configuration"
+log "Verifying registry configuration"
 
 az containerapp show \
     --resource-group "$RESOURCE_GROUP" \
@@ -440,10 +486,10 @@ az containerapp show \
     --output yaml
 
 #######################################
-# Verify deployment
+# Verify app
 #######################################
 
-log "Checking Alloy Container App"
+log "Verifying Alloy Container App"
 
 az containerapp show \
     --resource-group "$RESOURCE_GROUP" \
@@ -458,7 +504,7 @@ az containerapp show \
     --output yaml
 
 #######################################
-# Revision status
+# Revisions
 #######################################
 
 log "Checking Alloy revisions"
@@ -476,7 +522,7 @@ az containerapp revision list \
     --output table
 
 #######################################
-# Final output
+# Final
 #######################################
 
 log "Alloy deployment complete"
@@ -489,23 +535,22 @@ Alloy Container App:
 ACA Environment:
   $ACA_ENV_NAME
 
+Image:
+  $ALLOY_IMAGE
+
 ACR:
   $ACR_LOGIN_SERVER
-
-Alloy Image:
-  $ALLOY_IMAGE
 
 ACR Pull Identity:
   $ALLOY_ACR_IDENTITY_NAME
 
-Identity Client ID:
-  $ALLOY_ACR_IDENTITY_CLIENT_ID
-
 OTLP gRPC:
   $ALLOY_OTLP_GRPC_PORT
+  Internal TCP
 
 OTLP HTTP:
   $ALLOY_OTLP_HTTP_PORT
+  Internal HTTP
 
 Grafana OTLP endpoint:
   $GRAFANA_CLOUD_OTLP_ENDPOINT
@@ -516,4 +561,14 @@ Ingress:
 Credentials:
   Stored as ACA secrets
 
+Next verification:
+
+  python -c "
+  import socket
+  s = socket.create_connection(('${ALLOY_APP_NAME}', ${ALLOY_OTLP_GRPC_PORT}), timeout=5)
+  print('Alloy OTLP gRPC: CONNECTED')
+  s.close()
+  "
+
 EOF
+
